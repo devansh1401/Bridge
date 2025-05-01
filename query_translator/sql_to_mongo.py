@@ -7,9 +7,24 @@ from sqlparse.sql import (
     Parenthesis,
 )
 from sqlparse.tokens import Keyword, DML
+import re
 
 
-def sql_select_to_mongo(sql_query: str):
+def sql_select_to_mongo(sql_query: str) -> dict:
+    """
+    Convert a single SELECT...FROM...WHERE...ORDER BY...GROUP BY...LIMIT...
+    SQL statement into a MongoDB query dict.
+    """
+    # Validate comma-separated columns: if multiple words in SELECT list but no comma, error
+    mcols = re.search(r"SELECT\s+(.*?)\s+FROM", sql_query, re.IGNORECASE | re.DOTALL)
+    if mcols:
+        cols_txt = mcols.group(1).strip()
+        # ignore wildcard and single column
+        if cols_txt and cols_txt != '*' and ',' not in cols_txt and len(cols_txt.split()) > 1:
+            raise SyntaxError("Columns in SELECT must be comma-separated.")
+    # If there's a JOIN, use the specialized join handler
+    if re.search(r"\bJOIN\b", sql_query, re.IGNORECASE):
+        return _handle_join_query(sql_query)
     """
     Convert a SELECT...FROM...WHERE...ORDER BY...GROUP BY...LIMIT...
     into a Mongo dict:
@@ -26,16 +41,22 @@ def sql_select_to_mongo(sql_query: str):
     :param sql_query: The SQL SELECT query as a string.
     :return: A naive MongoDB find dict.
     """
+    # Disallow multiple statements
     parsed = sqlparse.parse(sql_query)
-    if not parsed:
-        return {}
-
+    if not parsed or len(parsed) != 1:
+        raise SyntaxError("Please provide exactly one valid SQL statement.")
     statement = parsed[0]
-    columns, table_name, where_clause, order_by, group_by, limit_val = parse_select_statement(statement)
+    if statement.get_type().upper() != "SELECT":
+        raise NotImplementedError("Only SELECT statements are supported.")
 
-    return build_mongo_query(
-        table_name, columns, where_clause, order_by, group_by, limit_val
-    )
+    cols, table, where, order, group, limit = parse_select_statement(statement)
+    # Ensure columns are specified (or wildcard)
+    if not cols or all(c == '' for c in cols):
+        raise SyntaxError("No columns specified in SELECT clause.")
+    if not table:
+        raise ValueError("Table name could not be determined from SQL query.")
+
+    return build_mongo_query(table, cols, where, order, group, limit)
 
 
 def parse_select_statement(statement):
@@ -409,3 +430,79 @@ def build_mongo_query(table_name, columns, where_clause, order_by, group_by, lim
         group_pipeline["$group"]["_id"] = _id_obj
         query_obj["group"] = group_pipeline
     return query_obj
+
+
+# --- JOIN HANDLER ---
+def _handle_join_query(sql_query: str) -> dict:
+    """
+    Handle a simple INNER JOIN query and convert it to a MongoDB aggregation pipeline.
+    Supports one JOIN with a single ON= equality condition.
+    """
+    # Match SELECT ... FROM ... [alias] JOIN ... [alias] ON ...; with optional clauses
+    pattern = re.compile(
+        r"^SELECT\s+(?P<cols>.*?)\s+FROM\s+(?P<tbl1>\w+)(?:\s+(?P<alias1>\w+))?"
+        r"\s+JOIN\s+(?P<tbl2>\w+)(?:\s+(?P<alias2>\w+))?"
+        r"\s+ON\s+(?P<t1>\w+)\.(?P<c1>\w+)\s*=\s*(?P<t2>\w+)\.(?P<c2>\w+)"
+        r"(?:\s+WHERE\s+(?P<where>.*?))?"
+        r"(?:\s+ORDER\s+BY\s+(?P<order>.*?))?"
+        r"(?:\s+LIMIT\s+(?P<limit>\d+))?"
+        r"\s*;?$",
+        re.IGNORECASE | re.DOTALL
+    )
+    m = pattern.match(sql_query.strip())
+    if not m:
+        raise SyntaxError("Unable to parse JOIN query.")
+    cols_str = m.group("cols")
+    tbl1 = m.group("tbl1")
+    alias1 = m.group("alias1") or tbl1
+    tbl2 = m.group("tbl2")
+    alias2 = m.group("alias2") or tbl2
+    t1 = m.group("t1")
+    c1 = m.group("c1")
+    t2 = m.group("t2")
+    c2 = m.group("c2")
+    where = m.group("where")
+    order = m.group("order")
+    limit = m.group("limit")
+
+    # Parse columns list
+    cols = [c.strip() for c in cols_str.split(",")]
+
+    pipeline = []
+    # $lookup stage (always map fields from actual table names)
+    pipeline.append({
+        "$lookup": {
+            "from": tbl2,
+            "localField": c1,
+            "foreignField": c2,
+            "as": alias2
+        }
+    })
+    # $unwind the joined array
+    pipeline.append({"$unwind": f"${alias2}"})
+    # Optional $match stage
+    if where:
+        pipeline.append({"$match": parse_where_conditions(where)})
+    # Optional $project stage
+    if cols and cols != ["*"]:
+        proj = {}
+        for col in cols:
+            if "." in col:
+                t, fld = col.split(".", 1)
+                if t == alias1:
+                    proj[f"{tbl1}.{fld}"] = 1
+                else:
+                    proj[f"{tbl2}.{fld}"] = 1
+            else:
+                proj[f"{tbl1}.{col}"] = 1
+        pipeline.append({"$project": proj})
+    # Optional $sort stage
+    if order:
+        order_list = parse_order_by(order)
+        sort_dict = {f: d for f, d in order_list}
+        pipeline.append({"$sort": sort_dict})
+    # Optional $limit stage
+    if limit:
+        pipeline.append({"$limit": int(limit)})
+
+    return {"collection": tbl1, "pipeline": pipeline}

@@ -1,37 +1,63 @@
 def mongo_find_to_sql(mongo_obj: dict) -> str:
     """
-    Convert a Mongo find dictionary into an extended SQL SELECT query.
+    Convert a Mongo-style query dict into a SQL SELECT statement.
 
-    Example input:
-    {
-      "collection": "users",
-      "find": {
-        "$or": [
-          {"age": {"$gte": 25}},
-          {"status": "ACTIVE"}
-        ]
-      },
-      "projection": {"age": 1, "status": 1},
-      "sort": [("age", 1), ("name", -1)],
-      "limit": 10,
-      "skip": 5
-    }
+    Supports:
+      - Simple find dict → WHERE
+      - projection → SELECT columns
+      - sort → ORDER BY
+      - limit, skip → LIMIT/OFFSET
+      - group key → GROUP BY + COUNT
+      - pipeline key ($lookup) → JOIN conversion
 
-    => Output:
-    SELECT age, status FROM users
-    WHERE ((age >= 25) OR (status = 'ACTIVE'))
-    ORDER BY age ASC, name DESC
-    LIMIT 10 OFFSET 5;
-
-    :param mongo_obj: The MongoDB find dict.
-    :return: The SQL SELECT query as a string.
+    :param mongo_obj: The MongoDB query dict or aggregation config.
+    :return: A SQL SELECT query string.
     """
+    # Handle GROUP BY conversion
+    if 'group' in mongo_obj:
+        grp = mongo_obj['group'].get('$group', {})
+        _id = grp.get('_id', {})
+        if not isinstance(_id, dict) or not _id:
+            raise ValueError("Invalid 'group' structure; expected '_id' dict.")
+        cols = list(_id.keys())
+        cols_str = ", ".join(cols)
+        sql = f"SELECT {cols_str}, COUNT(*) FROM {mongo_obj.get('collection')}"
+        where_sql = build_where_sql(mongo_obj.get('find', {}))
+        if where_sql:
+            sql += f" WHERE {where_sql}"
+        order_sql = build_order_by_sql(mongo_obj.get('sort', []))
+        if order_sql:
+            sql += f" GROUP BY {cols_str} ORDER BY {order_sql}"
+        else:
+            sql += f" GROUP BY {cols_str}"
+        lim = mongo_obj.get('limit')
+        if isinstance(lim, int) and lim > 0:
+            sql += f" LIMIT {lim}"
+        return sql + ";"
+
+    # If this is an aggregation pipeline (JOIN), delegate to the join handler
+    if 'pipeline' in mongo_obj:
+        return _handle_join_pipeline(mongo_obj)
+
+    # Validate input structure
+    if not isinstance(mongo_obj, dict):
+        raise TypeError("Input must be a dict representing a MongoDB query.")
+    if 'collection' not in mongo_obj or not isinstance(mongo_obj['collection'], str):
+        raise ValueError("Invalid MongoDB query: missing or invalid 'collection' key.")
+    if 'find' not in mongo_obj or not isinstance(mongo_obj['find'], dict):
+        raise ValueError("Invalid MongoDB query: missing or invalid 'find' key.")
+
     table = mongo_obj.get("collection", "unknown_table")
     find_filter = mongo_obj.get("find", {})
     projection = mongo_obj.get("projection", {})
     sort_clause = mongo_obj.get("sort", [])  # e.g. [("field", 1), ("other", -1)]
     limit_val = mongo_obj.get("limit", None)
     skip_val = mongo_obj.get("skip", None)
+
+    # Validate projection if provided
+    if 'projection' in mongo_obj:
+        if not isinstance(projection, dict) or any(val not in (0, 1) for val in projection.values()):
+            raise ValueError("Invalid 'projection'; must be a dict mapping fields to 0 or 1.")
 
     # 1) Build the column list from projection
     columns = "*"
@@ -44,8 +70,22 @@ def mongo_find_to_sql(mongo_obj: dict) -> str:
         if col_list:
             columns = ", ".join(col_list)
 
+    # Validate sort clause if provided
+    if 'sort' in mongo_obj:
+        if not isinstance(sort_clause, list) or any(
+            not (isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], str) and item[1] in (1, -1))
+            for item in sort_clause
+        ):
+            raise ValueError("Invalid 'sort'; must be a list of (field, 1 or -1) tuples.")
+
     # 2) Build WHERE from find_filter
     where_sql = build_where_sql(find_filter)
+
+    # Validate limit and skip
+    if 'limit' in mongo_obj and limit_val is not None and not isinstance(limit_val, int):
+        raise ValueError("Invalid 'limit'; must be an integer.")
+    if 'skip' in mongo_obj and skip_val is not None and not isinstance(skip_val, int):
+        raise ValueError("Invalid 'skip'; must be an integer.")
 
     # 3) Build ORDER BY from sort
     order_sql = build_order_by_sql(sort_clause)
@@ -225,3 +265,65 @@ def escape_quotes(s: str) -> str:
     :return: The escaped string.
     """
     return s.replace("'", "''")
+
+
+# --- JOIN PIPELINE HANDLER ---
+def _handle_join_pipeline(mongo_obj: dict) -> str:
+    """
+    Convert a MongoDB aggregation pipeline with $lookup into a SQL JOIN query.
+    Supports a single $lookup, optional $match, $project, $sort, and $limit stages.
+    """
+    table = mongo_obj.get("collection")
+    pipeline = mongo_obj.get("pipeline", [])
+    if not isinstance(pipeline, list) or not pipeline:
+        raise ValueError("Invalid pipeline: must be a non-empty list of stages.")
+
+    # Extract $lookup stage
+    lookup = pipeline[0].get("$lookup") if isinstance(pipeline[0], dict) else None
+    if not lookup:
+        raise ValueError("First pipeline stage must be a $lookup for JOIN conversion.")
+    joined = lookup.get("from")
+    local = lookup.get("localField")
+    foreign = lookup.get("foreignField")
+    if not (joined and local and foreign):
+        raise ValueError("$lookup must define 'from', 'localField', and 'foreignField'.")
+
+    # Initialize SQL
+    # Projection (fields)
+    proj = next((stage.get('$project') for stage in pipeline if '$project' in stage), None)
+    if proj:
+        cols = []
+        for key in proj:
+            # Remove any aliasing if present
+            if key.startswith(f"{joined}."):
+                cols.append(key)
+            else:
+                cols.append(f"{table}.{key}")
+        select_cols = ", ".join(cols)
+    else:
+        select_cols = f"{table}.*, {joined}.*"
+
+    sql = f"SELECT {select_cols} FROM {table} "
+    sql += f"JOIN {joined} ON {table}.{local} = {joined}.{foreign}"
+
+    # WHERE from $match
+    match_stage = next((stage.get('$match') for stage in pipeline if '$match' in stage), None)
+    if match_stage:
+        where_sql = build_where_sql(match_stage)
+        if where_sql:
+            sql += f" WHERE {where_sql}"
+
+    # ORDER BY from $sort
+    sort_stage = next((stage.get('$sort') for stage in pipeline if '$sort' in stage), None)
+    if sort_stage and isinstance(sort_stage, dict):
+        sort_list = [(f, d) for f, d in sort_stage.items()]
+        order_sql = build_order_by_sql(sort_list)
+        if order_sql:
+            sql += f" ORDER BY {order_sql}"
+
+    # LIMIT stage
+    limit_stage = next((stage.get('$limit') for stage in pipeline if '$limit' in stage), None)
+    if isinstance(limit_stage, int):
+        sql += f" LIMIT {limit_stage}"
+
+    return sql + ";"
