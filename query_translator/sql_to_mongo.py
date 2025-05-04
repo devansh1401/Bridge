@@ -6,57 +6,340 @@ from sqlparse.sql import (
     Token,
     Parenthesis,
 )
-from sqlparse.tokens import Keyword, DML
+from sqlparse.tokens import Keyword, DML, Punctuation, Whitespace
 import re
+from typing import Dict, List, Tuple, Union, Optional, Any
 
 
-def sql_select_to_mongo(sql_query: str) -> dict:
+def sql_to_mongo(sql_query: str) -> str:
     """
-    Convert a single SELECT...FROM...WHERE...ORDER BY...GROUP BY...LIMIT...
-    SQL statement into a MongoDB query dict.
+    Convert SQL statements (SELECT, INSERT, UPDATE, DELETE) to MongoDB commands.
+    Returns the MongoDB command as a string ready to be executed.
+    
+    :param sql_query: SQL query as a string
+    :return: MongoDB command as a string
     """
-    # Validate comma-separated columns: if multiple words in SELECT list but no comma, error
+    # Disallow multiple statements
+    parsed = sqlparse.parse(sql_query)
+    if not parsed or len(parsed) != 1:
+        raise SyntaxError("Please provide exactly one valid SQL statement.")
+    
+    statement = parsed[0]
+    statement_type = statement.get_type().upper()
+    
+    # Route to appropriate handler based on statement type
+    if statement_type == "SELECT":
+        return _handle_select(statement, sql_query)
+    elif statement_type == "INSERT":
+        return _handle_insert(statement, sql_query)
+    elif statement_type == "UPDATE":
+        return _handle_update(statement, sql_query)
+    elif statement_type == "DELETE":
+        return _handle_delete(statement, sql_query)
+    else:
+        raise NotImplementedError(f"Statement type '{statement_type}' is not supported.")
+
+
+def _handle_select(statement, sql_query: str) -> str:
+    """
+    Handle SELECT statements and convert to MongoDB find() or aggregate()
+    
+    :param statement: The parsed SQL statement
+    :param sql_query: Original SQL query string
+    :return: MongoDB command as a string
+    """
+    # Check for JOIN
+    if re.search(r"\bJOIN\b", sql_query, re.IGNORECASE):
+        result = _handle_join_query(sql_query)
+        return _format_mongo_aggregate(result["collection"], result["pipeline"])
+    
+    # Validate comma-separated columns
     mcols = re.search(r"SELECT\s+(.*?)\s+FROM", sql_query, re.IGNORECASE | re.DOTALL)
     if mcols:
         cols_txt = mcols.group(1).strip()
         # ignore wildcard and single column
         if cols_txt and cols_txt != '*' and ',' not in cols_txt and len(cols_txt.split()) > 1:
             raise SyntaxError("Columns in SELECT must be comma-separated.")
-    # If there's a JOIN, use the specialized join handler
-    if re.search(r"\bJOIN\b", sql_query, re.IGNORECASE):
-        return _handle_join_query(sql_query)
-    """
-    Convert a SELECT...FROM...WHERE...ORDER BY...GROUP BY...LIMIT...
-    into a Mongo dict:
-
-    {
-      "collection": <table>,
-      "find": { ...where... },
-      "projection": { col1:1, col2:1 } or None,
-      "sort": [...],
-      "limit": int,
-      "group": { ... }
-    }
-
-    :param sql_query: The SQL SELECT query as a string.
-    :return: A naive MongoDB find dict.
-    """
-    # Disallow multiple statements
-    parsed = sqlparse.parse(sql_query)
-    if not parsed or len(parsed) != 1:
-        raise SyntaxError("Please provide exactly one valid SQL statement.")
-    statement = parsed[0]
-    if statement.get_type().upper() != "SELECT":
-        raise NotImplementedError("Only SELECT statements are supported.")
-
+    
     cols, table, where, order, group, limit = parse_select_statement(statement)
+    
     # Ensure columns are specified (or wildcard)
     if not cols or all(c == '' for c in cols):
         raise SyntaxError("No columns specified in SELECT clause.")
     if not table:
         raise ValueError("Table name could not be determined from SQL query.")
+    
+    mongo_query = build_mongo_query(table, cols, where, order, group, limit)
+    
+    # If we have a GROUP BY clause, it needs to be handled as an aggregation
+    if group:
+        return _format_mongo_aggregate(mongo_query["collection"], [mongo_query["group"]])
+    
+    # Format the query as db.<collection>.find()
+    return _format_mongo_find(mongo_query)
 
-    return build_mongo_query(table, cols, where, order, group, limit)
+
+def _handle_insert(statement, sql_query: str) -> str:
+    """
+    Handle INSERT statements and convert to MongoDB insertOne() or insertMany()
+    
+    :param statement: The parsed SQL statement
+    :param sql_query: Original SQL query string
+    :return: MongoDB command as a string
+    """
+    # Match: INSERT INTO table_name (col1, col2, ...) VALUES (val1, val2, ...)
+    single_insert_pattern = re.compile(
+        r"INSERT\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)",
+        re.IGNORECASE
+    )
+    
+    # Match: INSERT INTO table_name VALUES (val1, val2, ...)
+    simple_insert_pattern = re.compile(
+        r"INSERT\s+INTO\s+(\w+)\s*VALUES\s*\(([^)]+)\)",
+        re.IGNORECASE
+    )
+    
+    # Match: INSERT INTO table_name (col1, col2, ...) VALUES (val1, val2, ...), (val1, val2, ...)
+    multi_insert_pattern = re.compile(
+        r"INSERT\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*(\((?:[^)(]+|\([^)(]*\))*\)(?:\s*,\s*\((?:[^)(]+|\([^)(]*\))*\))*)",
+        re.IGNORECASE
+    )
+    
+    # Try to match with columns first
+    match = single_insert_pattern.search(sql_query)
+    multi_match = multi_insert_pattern.search(sql_query)
+    simple_match = None
+    
+    if multi_match:
+        # Handle multi-row insert
+        table_name = multi_match.group(1)
+        columns = [col.strip() for col in multi_match.group(2).split(',')]
+        values_block = multi_match.group(3)
+        
+        # Extract all value sets
+        value_sets = re.findall(r'\(([^)]+)\)', values_block)
+        documents = []
+        
+        for value_set in value_sets:
+            values = [_parse_sql_value(val.strip()) for val in value_set.split(',')]
+            if len(values) != len(columns):
+                raise ValueError(f"Number of values ({len(values)}) doesn't match number of columns ({len(columns)})")
+            
+            document = dict(zip(columns, values))
+            documents.append(document)
+        
+        if len(documents) == 1:
+            return f"db.{table_name}.insertOne({_format_json(documents[0])})"
+        else:
+            return f"db.{table_name}.insertMany({_format_json(documents)})"
+    
+    elif match:
+        # Handle single row insert with columns
+        table_name = match.group(1)
+        columns = [col.strip() for col in match.group(2).split(',')]
+        values = [_parse_sql_value(val.strip()) for val in match.group(3).split(',')]
+        
+        if len(values) != len(columns):
+            raise ValueError(f"Number of values ({len(values)}) doesn't match number of columns ({len(columns)})")
+        
+        document = dict(zip(columns, values))
+        return f"db.{table_name}.insertOne({_format_json(document)})"
+    
+    else:
+        # Try simple insert format
+        simple_match = simple_insert_pattern.search(sql_query)
+        if simple_match:
+            table_name = simple_match.group(1)
+            values = [_parse_sql_value(val.strip()) for val in simple_match.group(2).split(',')]
+            
+            # Without column names, we'll create a document with positional field names
+            document = {f"field{i+1}": val for i, val in enumerate(values)}
+            return f"db.{table_name}.insertOne({_format_json(document)})"
+    
+    raise SyntaxError("Invalid INSERT statement format")
+
+
+def _handle_update(statement, sql_query: str) -> str:
+    """
+    Handle UPDATE statements and convert to MongoDB updateOne() or updateMany()
+    
+    :param statement: The parsed SQL statement
+    :param sql_query: Original SQL query string
+    :return: MongoDB command as a string
+    """
+    # Match: UPDATE table_name SET col1 = val1, col2 = val2 [WHERE condition]
+    update_pattern = re.compile(
+        r"UPDATE\s+(\w+)\s+SET\s+(.+?)(?:\s+WHERE\s+(.+?))?(?:\s*;)?$",
+        re.IGNORECASE | re.DOTALL
+    )
+    
+    match = update_pattern.search(sql_query)
+    if not match:
+        raise SyntaxError("Invalid UPDATE statement format")
+    
+    table_name = match.group(1)
+    set_clause = match.group(2).strip()
+    where_clause = match.group(3)
+    
+    # Parse SET assignments
+    set_items = {}
+    for item in set_clause.split(','):
+        if '=' not in item:
+            raise SyntaxError(f"Invalid SET clause: {item}")
+        
+        field, value = item.split('=', 1)
+        field = field.strip()
+        value = _parse_sql_value(value.strip())
+        set_items[field] = value
+    
+    # Parse WHERE conditions if present
+    filter_query = {}
+    if where_clause:
+        filter_query = parse_where_conditions(where_clause)
+    
+    # Determine if updateOne or updateMany
+    # For now, we'll use updateMany as the safer default
+    update_command = "updateMany"
+    
+    return f"db.{table_name}.{update_command}({_format_json(filter_query)}, {{'$set': {_format_json(set_items)}}})"
+
+
+def _handle_delete(statement, sql_query: str) -> str:
+    """
+    Handle DELETE statements and convert to MongoDB deleteOne() or deleteMany()
+    
+    :param statement: The parsed SQL statement
+    :param sql_query: Original SQL query string
+    :return: MongoDB command as a string
+    """
+    # Match: DELETE FROM table_name [WHERE condition]
+    delete_pattern = re.compile(
+        r"DELETE\s+FROM\s+(\w+)(?:\s+WHERE\s+(.+?))?(?:\s*;)?$",
+        re.IGNORECASE | re.DOTALL
+    )
+    
+    match = delete_pattern.search(sql_query)
+    if not match:
+        raise SyntaxError("Invalid DELETE statement format")
+    
+    table_name = match.group(1)
+    where_clause = match.group(2)
+    
+    # Parse WHERE conditions if present
+    filter_query = {}
+    if where_clause:
+        filter_query = parse_where_conditions(where_clause)
+    
+    # Determine if deleteOne or deleteMany
+    # For now, we'll use deleteMany as the safer default
+    delete_command = "deleteMany"
+    if filter_query and "_id" in filter_query:
+        delete_command = "deleteOne"  # If specific ID, use deleteOne
+    
+    return f"db.{table_name}.{delete_command}({_format_json(filter_query)})"
+
+
+def _format_mongo_find(query_obj: dict) -> str:
+    """
+    Format a MongoDB query object into a db.<collection>.find() style string
+    
+    :param query_obj: The MongoDB query object
+    :return: A formatted MongoDB command string
+    """
+    collection = query_obj["collection"]
+    find_filter = query_obj.get("find", {})
+    projection = query_obj.get("projection")
+    sort = query_obj.get("sort")
+    limit = query_obj.get("limit")
+    
+    # Start with the basic find command
+    cmd = f"db.{collection}.find({_format_json(find_filter)}"
+    
+    # Add projection if present
+    if projection:
+        cmd += f", {_format_json(projection)}"
+    cmd += ")"
+    
+    # Add sort if present
+    if sort:
+        sort_obj = {field: direction for field, direction in sort}
+        cmd += f".sort({_format_json(sort_obj)})"
+    
+    # Add limit if present
+    if limit:
+        cmd += f".limit({limit})"
+    
+    return cmd
+
+
+def _format_mongo_aggregate(collection: str, pipeline: list) -> str:
+    """
+    Format a MongoDB aggregation pipeline into a db.<collection>.aggregate() style string
+    
+    :param collection: The collection name
+    :param pipeline: The aggregation pipeline
+    :return: A formatted MongoDB command string
+    """
+    return f"db.{collection}.aggregate({_format_json(pipeline)})"
+
+
+def _format_json(obj: Any) -> str:
+    """
+    Convert a Python object to a MongoDB-style JSON string
+    
+    :param obj: The Python object to convert
+    :return: A JSON string in MongoDB format
+    """
+    if isinstance(obj, dict):
+        items = []
+        for k, v in obj.items():
+            items.append(f"{k}: {_format_json(v)}")
+        return "{ " + ", ".join(items) + " }"
+    elif isinstance(obj, list):
+        items = [_format_json(item) for item in obj]
+        return "[ " + ", ".join(items) + " ]"
+    elif isinstance(obj, str):
+        # Escape double quotes
+        escaped = obj.replace('"', '\\"')
+        return f'"{escaped}"'
+    elif obj is None:
+        return "null"
+    else:
+        return str(obj)
+
+
+def _parse_sql_value(value: str) -> Any:
+    """
+    Parse SQL values into equivalent Python/MongoDB types
+    
+    :param value: The SQL value as a string
+    :return: The parsed value
+    """
+    value = value.strip()
+    
+    # Handle string literals
+    if (value.startswith("'") and value.endswith("'")) or (value.startswith('"') and value.endswith('"')):
+        return value[1:-1]
+    
+    # Handle NULL
+    if value.upper() == "NULL":
+        return None
+    
+    # Handle booleans
+    if value.upper() == "TRUE":
+        return True
+    if value.upper() == "FALSE":
+        return False
+    
+    # Handle numbers
+    try:
+        if '.' in value:
+            return float(value)
+        else:
+            return int(value)
+    except ValueError:
+        # If we can't parse it as a number, return as is
+        return value
 
 
 def parse_select_statement(statement):
@@ -506,3 +789,42 @@ def _handle_join_query(sql_query: str) -> dict:
         pipeline.append({"$limit": int(limit)})
 
     return {"collection": tbl1, "pipeline": pipeline}
+
+
+# For backward compatibility
+def sql_select_to_mongo(sql_query: str) -> dict:
+    """
+    Legacy function to maintain backward compatibility.
+    Convert a SELECT SQL query to a MongoDB query dict.
+    
+    :param sql_query: The SQL query as a string
+    :return: A MongoDB query dict
+    """
+    # Parse the SQL query
+    parsed = sqlparse.parse(sql_query)
+    if not parsed or len(parsed) != 1:
+        raise SyntaxError("Please provide exactly one valid SQL statement.")
+    
+    statement = parsed[0]
+    if statement.get_type().upper() != "SELECT":
+        raise NotImplementedError("Only SELECT statements are supported by this function.")
+    
+    # If JOIN, use specialized handler
+    if re.search(r"\bJOIN\b", sql_query, re.IGNORECASE):
+        return _handle_join_query(sql_query)
+    
+    # Validate comma-separated columns
+    mcols = re.search(r"SELECT\s+(.*?)\s+FROM", sql_query, re.IGNORECASE | re.DOTALL)
+    if mcols:
+        cols_txt = mcols.group(1).strip()
+        if cols_txt and cols_txt != '*' and ',' not in cols_txt and len(cols_txt.split()) > 1:
+            raise SyntaxError("Columns in SELECT must be comma-separated.")
+    
+    cols, table, where, order, group, limit = parse_select_statement(statement)
+    
+    if not cols or all(c == '' for c in cols):
+        raise SyntaxError("No columns specified in SELECT clause.")
+    if not table:
+        raise ValueError("Table name could not be determined from SQL query.")
+    
+    return build_mongo_query(table, cols, where, order, group, limit)
