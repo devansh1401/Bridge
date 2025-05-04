@@ -1,5 +1,5 @@
 from .sql_to_mongo import sql_select_to_mongo
-from .mongo_to_sql import mongo_find_to_sql
+from .mongo_to_sql import mongo_query_to_sql
 
 
 def sql_to_mongo(sql_query: str):
@@ -19,4 +19,4 @@ def mongo_to_sql(mongo_obj: dict):
     :param mongo_obj: The MongoDB find dict.
     :return: The SQL SELECT query as a string.
     """
-    return mongo_find_to_sql(mongo_obj)
+    return mongo_query_to_sql(mongo_obj)
