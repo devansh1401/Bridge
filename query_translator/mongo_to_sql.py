@@ -76,15 +76,16 @@ class MongoToSql:
             (r'(\s*)or(\s*):',  r'\1"$or"\2:'),
             (r'(\s*)and(\s*):', r'\1"$and"\2:'),
         ]
-        
+
         for pattern, replacement in operator_patterns:
             js_obj_str = re.sub(pattern, replacement, js_obj_str)
         
         # 2. Quote all remaining unquoted keys at all levels
         # This is more complex - we need to handle nested objects
+        # Quote all remaining unquoted keys
         def quote_keys(match):
             return f'"{match.group(1)}":'
-        
+
         # Look for word characters followed by a colon (but not already quoted)
         js_obj_str = re.sub(r'(?<!")(\w+)(?=\s*:)', quote_keys, js_obj_str)
         
