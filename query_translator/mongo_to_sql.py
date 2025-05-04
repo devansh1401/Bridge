@@ -16,6 +16,7 @@ class MongoToSql:
     
     def __init__(self):
         # Regex patterns for parsing MongoDB shell syntax
+        # In MongoToSql.__init__
         self.find_pattern = r'db\.(\w+)\.find\(([\s\S]*?)\)(?:\.sort\(([\s\S]*?)\))?(?:\.limit\((\d+)\))?(?:\.skip\((\d+)\))?'
         self.insert_pattern = r'db\.(\w+)\.insert(?:One|Many)?\((.*)\)'
         self.update_pattern = r'db\.(\w+)\.update(?:One|Many)?\((.*?),\s*(.*?)(?:,\s*({.*?}))?\)'
@@ -49,33 +50,46 @@ class MongoToSql:
     def _parse_mongo_json(self, js_obj_str: str) -> Dict:
         """
         Parse MongoDB-style JSON objects with improved handling for complex structures.
-        
-        :param js_obj_str: String containing MongoDB-style JSON object
-        :return: Python dictionary representation
         """
         js_obj_str = js_obj_str.strip()
         
         # If empty, return empty dict
         if not js_obj_str or js_obj_str == '{}':
             return {}
-            
-        # Check for balanced brackets
-        if js_obj_str.count('[') != js_obj_str.count(']') or js_obj_str.count('{') != js_obj_str.count('}'):
-            # Try to complete the object by adding missing brackets
-            js_obj_str = self._balance_brackets(js_obj_str)
         
+        # Replace MongoDB operators with a special marker to preserve them
+        # This is a workaround for Python's eval that doesn't handle $ in identifiers
+        op_replacements = {}
+        for op in ['$gt', '$gte', '$lt', '$lte', '$eq', '$ne', '$in', '$nin', '$regex', '$exists', '$or', '$and']:
+            placeholder = f"___OP_{op[1:]}___"
+            js_obj_str = js_obj_str.replace(op, placeholder)
+            op_replacements[placeholder] = op
+        
+        # Replace booleans for Python compatibility
         js_obj_str = js_obj_str.replace('true', 'True').replace('false', 'False')
+        
         try:
-            # Use eval with an empty __builtins__ dict for security
-            return eval(js_obj_str, {"__builtins__": {}})
+            # Parse with eval
+            parsed = eval(js_obj_str, {"__builtins__": {}})
+            
+            # Restore MongoDB operators
+            def restore_operators(obj):
+                if isinstance(obj, dict):
+                    new_dict = {}
+                    for k, v in obj.items():
+                        new_key = k
+                        for placeholder, op in op_replacements.items():
+                            if placeholder in k:
+                                new_key = k.replace(placeholder, op)
+                        new_dict[new_key] = restore_operators(v)
+                    return new_dict
+                elif isinstance(obj, list):
+                    return [restore_operators(item) for item in obj]
+                else:
+                    return obj
+            
+            return restore_operators(parsed)
         except Exception as e:
-            # If eval fails, try a manual approach for common MongoDB query formats
-            if "$or" in js_obj_str:
-                try:
-                    # Special handling for $or operator
-                    return self._parse_or_operator(js_obj_str)
-                except:
-                    pass
             raise ValueError(f"Error parsing MongoDB query object: {js_obj_str}\nError: {str(e)}")
             
     def _safe_eval(self, js_obj_str: str) -> Dict:
