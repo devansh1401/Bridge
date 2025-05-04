@@ -11,33 +11,19 @@ tab1, tab2 = st.tabs(["SQL → MongoDB", "MongoDB → SQL"])
 
 with tab1:
     st.subheader("SQL to MongoDB")
-    sql_type = st.selectbox(
-        "SQL operation type:",
-        ["SELECT", "INSERT", "UPDATE", "DELETE"],
-        key="sql_type"
-    )
-    
-    placeholders = {
-        "SELECT": "e.g. SELECT name, age FROM users WHERE age > 30 AND name = 'Alice';",
-        "INSERT": "e.g. INSERT INTO users (name, age, email) VALUES ('John', 30, 'john@example.com');",
-        "UPDATE": "e.g. UPDATE users SET age = 31 WHERE name = 'John';",
-        "DELETE": "e.g. DELETE FROM users WHERE status = 'inactive';"
-    }
-    
     sql_input = st.text_area(
         "Enter your SQL query:",
-        height=150,
-        placeholder=placeholders[sql_type]
+        height=200,
+        placeholder='e.g. SELECT name, age FROM users WHERE age > 30 AND name = "Alice";'
     )
-    
     if st.button("Convert to MongoDB", key="sql2mongo"):
         if not sql_input.strip():
-            st.warning(f"Please enter a SQL {sql_type} query.")
+            st.warning("Please enter a SQL query.")
         else:
             try:
-                mongo_result = sql_to_mongo(sql_input)
-                st.success("MongoDB Command:")
-                st.code(mongo_result, language="javascript")
+                mongodb_result = sql_to_mongo(sql_input)
+                st.success("MongoDB Query:")
+                st.code(mongodb_result, language="mongodb")
             except Exception as e:
                 st.error(f"Error: {e}")
 
