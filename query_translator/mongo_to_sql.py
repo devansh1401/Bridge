@@ -60,32 +60,54 @@ class MongoToSql:
         if not js_obj_str or js_obj_str == '{}':
             return {}
         
-        # Convert MongoDB shell syntax to valid JSON
-        # 1. Quote unquoted keys
-        js_obj_str = re.sub(r'(\s*)(\w+)(\s*):', r'\1"\2"\3:', js_obj_str)
+        # Special handling for MongoDB shell syntax:
         
-        # 2. Replace MongoDB operators with valid JSON
+        # 1. First handle the case where 'gt' is used without the '$' prefix
+        # Look for MongoDB operators without $ and add the $
+        operator_patterns = [
+            (r'(\s*)gt(\s*):',  r'\1"$gt"\2:'),
+            (r'(\s*)gte(\s*):', r'\1"$gte"\2:'),
+            (r'(\s*)lt(\s*):',  r'\1"$lt"\2:'),
+            (r'(\s*)lte(\s*):', r'\1"$lte"\2:'),
+            (r'(\s*)eq(\s*):',  r'\1"$eq"\2:'),
+            (r'(\s*)ne(\s*):',  r'\1"$ne"\2:'),
+            (r'(\s*)in(\s*):',  r'\1"$in"\2:'),
+            (r'(\s*)nin(\s*):', r'\1"$nin"\2:'),
+            (r'(\s*)or(\s*):',  r'\1"$or"\2:'),
+            (r'(\s*)and(\s*):', r'\1"$and"\2:'),
+        ]
+        
+        for pattern, replacement in operator_patterns:
+            js_obj_str = re.sub(pattern, replacement, js_obj_str)
+        
+        # 2. Quote all remaining unquoted keys at all levels
+        # This is more complex - we need to handle nested objects
+        def quote_keys(match):
+            return f'"{match.group(1)}":'
+        
+        # Look for word characters followed by a colon (but not already quoted)
+        js_obj_str = re.sub(r'(?<!")(\w+)(?=\s*:)', quote_keys, js_obj_str)
+        
+        # 3. Handle MongoDB operators with $ prefix
         for op in ['$gt', '$gte', '$lt', '$lte', '$eq', '$ne', '$in', '$nin', '$regex', '$exists', '$or', '$and']:
-            js_obj_str = js_obj_str.replace(op, f'"{op}"')
-        
-        # 3. Replace JS booleans with Python booleans
-        js_obj_str = js_obj_str.replace('true', 'True').replace('false', 'False')
+            # Make sure the operator is properly quoted
+            js_obj_str = js_obj_str.replace(f'"{op}"', f'"{op}"')
+            # Also handle the case where $ might not be in quotes
+            js_obj_str = js_obj_str.replace(f'{op}:', f'"{op}":')
         
         try:
-            # Use ast.literal_eval which is safer than eval
-            import ast
-            # First try to use literal_eval (safest)
+            # Try json.loads first as it's safer
+            import json
             try:
-                parsed = ast.literal_eval(js_obj_str)
-                return parsed
-            except (SyntaxError, ValueError):
-                # If literal_eval fails, fall back to json.loads
-                # But first we need to fix any remaining JS/Python differences
-                js_obj_str = js_obj_str.replace("'", '"')  # Replace single quotes with double quotes
-                js_obj_str = js_obj_str.replace('True', 'true').replace('False', 'false')  # Convert back to JS booleans
-                import json
                 return json.loads(js_obj_str)
+            except json.JSONDecodeError:
+                # If that fails, try ast.literal_eval as a fallback
+                import ast
+                # Convert JS booleans/null to Python
+                js_obj_str = js_obj_str.replace('true', 'True').replace('false', 'False').replace('null', 'None')
+                return ast.literal_eval(js_obj_str)
         except Exception as e:
+            # If all parsing attempts fail, provide a helpful error message
             raise ValueError(f"Error parsing MongoDB query object: {js_obj_str}\nError: {str(e)}")
             
     def _safe_eval(self, js_obj_str: str) -> Dict:
