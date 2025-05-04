@@ -544,15 +544,38 @@ def parse_where_conditions(text: str):
     if not text:
         return {}
 
-    # naive split on " AND "
+    # Split on " AND " but handle case where there's no space around operators
     parts = text.split(" AND ")
     out = {}
+    
     for part in parts:
+        part = part.strip()
+        
+        # Handle cases like "name='value'" without spaces
+        if '=' in part and ' = ' not in part:
+            field, val = part.split('=', 1)
+            field = field.strip()
+            val = val.strip()
+            # Handle quoted values
+            if (val.startswith("'") and val.endswith("'")) or (val.startswith('"') and val.endswith('"')):
+                val = val[1:-1]  # Remove quotes
+            out[field] = val
+            continue
+            
+        # Original logic for handling conditions with spaces
         tokens = part.split(None, 2)  # e.g. ["age", ">", "30"]
         if len(tokens) < 3:
+            # Handle case where part might not have enough tokens
             continue
+            
         field, op, val = tokens[0], tokens[1], tokens[2]
-        val = val.strip().rstrip(";").strip("'").strip('"')
+        field = field.strip()
+        val = val.strip().rstrip(";")
+        
+        # Handle quoted values
+        if (val.startswith("'") and val.endswith("'")) or (val.startswith('"') and val.endswith('"')):
+            val = val[1:-1]  # Remove quotes
+            
         if op == "=":
             out[field] = val
         elif op == ">":
@@ -565,6 +588,7 @@ def parse_where_conditions(text: str):
             out[field] = {"$lte": convert_value(val)}
         else:
             out[field] = {"$op?": val}
+            
     return out
 
 
