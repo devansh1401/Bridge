@@ -50,6 +50,9 @@ class MongoToSql:
     def _parse_mongo_json(self, js_obj_str: str) -> Dict:
         """
         Parse MongoDB-style JSON objects with improved handling for complex structures.
+        
+        :param js_obj_str: String containing MongoDB-style JSON object
+        :return: Python dictionary representation
         """
         js_obj_str = js_obj_str.strip()
         
@@ -57,38 +60,31 @@ class MongoToSql:
         if not js_obj_str or js_obj_str == '{}':
             return {}
         
-        # Replace MongoDB operators with a special marker to preserve them
-        # This is a workaround for Python's eval that doesn't handle $ in identifiers
-        op_replacements = {}
-        for op in ['$gt', '$gte', '$lt', '$lte', '$eq', '$ne', '$in', '$nin', '$regex', '$exists', '$or', '$and']:
-            placeholder = f"___OP_{op[1:]}___"
-            js_obj_str = js_obj_str.replace(op, placeholder)
-            op_replacements[placeholder] = op
+        # Convert MongoDB shell syntax to valid JSON
+        # 1. Quote unquoted keys
+        js_obj_str = re.sub(r'(\s*)(\w+)(\s*):', r'\1"\2"\3:', js_obj_str)
         
-        # Replace booleans for Python compatibility
+        # 2. Replace MongoDB operators with valid JSON
+        for op in ['$gt', '$gte', '$lt', '$lte', '$eq', '$ne', '$in', '$nin', '$regex', '$exists', '$or', '$and']:
+            js_obj_str = js_obj_str.replace(op, f'"{op}"')
+        
+        # 3. Replace JS booleans with Python booleans
         js_obj_str = js_obj_str.replace('true', 'True').replace('false', 'False')
         
         try:
-            # Parse with eval
-            parsed = eval(js_obj_str, {"__builtins__": {}})
-            
-            # Restore MongoDB operators
-            def restore_operators(obj):
-                if isinstance(obj, dict):
-                    new_dict = {}
-                    for k, v in obj.items():
-                        new_key = k
-                        for placeholder, op in op_replacements.items():
-                            if placeholder in k:
-                                new_key = k.replace(placeholder, op)
-                        new_dict[new_key] = restore_operators(v)
-                    return new_dict
-                elif isinstance(obj, list):
-                    return [restore_operators(item) for item in obj]
-                else:
-                    return obj
-            
-            return restore_operators(parsed)
+            # Use ast.literal_eval which is safer than eval
+            import ast
+            # First try to use literal_eval (safest)
+            try:
+                parsed = ast.literal_eval(js_obj_str)
+                return parsed
+            except (SyntaxError, ValueError):
+                # If literal_eval fails, fall back to json.loads
+                # But first we need to fix any remaining JS/Python differences
+                js_obj_str = js_obj_str.replace("'", '"')  # Replace single quotes with double quotes
+                js_obj_str = js_obj_str.replace('True', 'true').replace('False', 'false')  # Convert back to JS booleans
+                import json
+                return json.loads(js_obj_str)
         except Exception as e:
             raise ValueError(f"Error parsing MongoDB query object: {js_obj_str}\nError: {str(e)}")
             
