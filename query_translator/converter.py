@@ -12,7 +12,7 @@ def sql_to_mongo(sql_query: str):
     return sql_select_to_mongo(sql_query)
 
 
-def mongo_to_sql(mongo_obj: dict):
+def mongo_to_sql(mongo_obj: str):
     """
     Converts a naive Mongo 'find' dict to a basic SQL SELECT.
 
