@@ -30,21 +30,18 @@ with tab1:
 with tab2:
     st.subheader("MongoDB to SQL")
     mongo_input = st.text_area(
-        "Enter your MongoDB query as JSON:",
+        "Enter your MongoDB query:",
         height=200,
-        placeholder='e.g. {\n  "collection": "users",\n  "find": {"age": {"$gte": 25}},\n  "projection": {"age": 1}\n}'
+        placeholder='e.g. db.users.find({"age": {"$gte": 25}}, {"age": 1})'
     )
     if st.button("Convert to SQL", key="mongo2sql"):
         if not mongo_input.strip():
-            st.warning("Please enter a MongoDB query in JSON format.")
+            st.warning("Please enter a MongoDB query.")
         else:
             try:
-                mongo_obj = json.loads(mongo_input)
-                sql_result = mongo_to_sql(mongo_obj)
+                sql_result = mongo_to_sql(mongo_input)
                 st.success("SQL Query:")
                 st.code(sql_result, language="sql")
-            except json.JSONDecodeError:
-                st.error("Invalid JSON. Please check your MongoDB query input.")
             except Exception as e:
                 st.error(f"Error: {e}")
 
